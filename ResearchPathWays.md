@@ -38,3 +38,70 @@ Use the fast coarse levels to produce a plan or draft that a larger AR model con
 - The 4–5× lower training-token budget counts token exposure, not FLOPs.
 
 If you want one place to start, I'd pick #2 or #3. Both have clear verifiers and cheap compute, and they build on the paper's strongest result. I can sketch an experiment plan for any of them if you tell me your GPU budget.
+
+# apply NCM VQ VAE to dota8 dataset
+
+1. **The NCM tokenizer itself is text-specific.** Its encoder embeds tokens, its decoder predicts token logits with cross-entropy, and the repo reflects that. For images, the same idea already exists as the multiscale residual VQ-VAE in VAR (next-scale prediction), which the NCM paper cites as its inspiration. So you would be applying the NCM/VAR *recipe* to images, not NCM's code.
+2. **Eight images is far too few to train a VQ-VAE.** It would memorize them. Use DOTA8 only as a smoke test (does the pipeline run, can it overfit). Train on random crops from full DOTA or your own satellite tiles. Fine-tuning a pretrained VAR tokenizer is more realistic than training from scratch.
+
+## What changes from text to images
+
+| NCM (text) | Image version |
+|---|---|
+| Token embedding encoder, L×d latents | Conv encoder to a d×16×16 latent grid |
+| Level k has ℓ_k codes | Level k is an s_k×s_k grid, e.g. (1,2,3,4,6,8,12,16) |
+| Down_k / R_k on 1D sequences | `interpolate` down, then up plus a small conv |
+| Decoder with cross-entropy over tokens | Conv decoder with L1 + LPIPS (optionally GAN) loss |
+| Nested dropout over levels | Same, unchanged |
+| Loss at the sampled cutoff | Same: commitment + codebook loss on the cumulative reconstruction |
+
+## Quantizer sketch (PyTorch, untested)
+
+```python
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class MSResidualVQ(nn.Module):
+    def __init__(self, d=256, V=4096, scales=(1,2,3,4,6,8,12,16), beta=0.25):
+        super().__init__()
+        self.scales, self.beta = scales, beta
+        self.codebooks = nn.ModuleList(nn.Embedding(V, d) for _ in scales)
+        self.phi = nn.ModuleList(nn.Conv2d(d, d, 3, padding=1) for _ in scales)  # R_k
+
+    def forward(self, f, k_cut=None):            # f: B,d,H,W from the encoder
+        B, d, H, W = f.shape
+        K = len(self.scales); k_cut = k_cut or K  # nested dropout: sample k_cut in training
+        f_hat, codes = torch.zeros_like(f), []
+        for k in range(k_cut):
+            s = self.scales[k]
+            u = F.interpolate((f - f_hat).detach(), size=(s, s), mode='area')   # Down_k
+            flat = u.permute(0,2,3,1).reshape(-1, d)
+            idx = torch.cdist(flat, self.codebooks[k].weight).argmin(1)
+            e = self.codebooks[k](idx).view(B, s, s, d).permute(0,3,1,2)
+            up = F.interpolate(e, size=(H, W), mode='bicubic')
+            f_hat = f_hat + self.phi[k](up)                                      # R_k
+            codes.append(idx.view(B, s, s))
+        loss = self.beta * F.mse_loss(f_hat.detach(), f) + F.mse_loss(f_hat, f.detach())
+        f_st = f + (f_hat - f).detach()          # straight-through to the encoder
+        return f_st, codes, loss
+```
+
+Training step: `z = enc(img)`, then `k = random.randint(1, K)` (with some probability use the full K), then `z_q, codes, vq_loss = quant(z, k)`, `recon = dec(z_q)`, and `loss = l1(recon, img) + λ·lpips(recon, img) + vq_loss`. Add EMA codebook updates and dead-code resets if utilization is low (the paper reports 62–90% utilization).
+
+## Steps
+
+1. **Data:** Cut DOTA (or your own imagery) into 256×256 crops with random flips and rotations. Ignore the oriented-box labels for the tokenizer.
+2. **Base:** Start from VAR's open-source multiscale VQ-VAE (check the repo for its exact scale config) and fine-tune it on your crops, or train the sketch above from scratch.
+3. **Smoke test on DOTA8:** Overfit the 8 images and confirm that reconstruction improves with more levels.
+4. **Evaluate:**
+   - PSNR/LPIPS after each level.
+   - Codebook utilization per level.
+   - Visual reconstructions per level.
+   - Small-object survival. DOTA has tiny vehicles that a 16× downsample can wipe out, so try 8× (a 32×32 grid for 256 crops) if they vanish.
+5. **Optional second stage:** Train a VAR-style transformer that predicts level k from the cumulative reconstruction of levels 1..k−1. NCM's text-specific parts (prefix-LM conditioning, block-diagonal attention over 1D blocks) need adapting to 2D.
+
+## Limits
+
+- A VQ-VAE doesn't do detection. It gives you compression, generation, or coarse-to-fine features. If your goal is detection or segmentation of rooftops, a pretrained detector will serve you better, and the codes would only be an auxiliary representation.
+- None of this has been validated on aerial imagery, so treat it as an experiment.
+
+What are you hoping to get out of it: generation, compression, or features for a downstream detector?

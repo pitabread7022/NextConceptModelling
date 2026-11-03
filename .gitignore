@@ -11,3 +11,6 @@ wheels/
 *.ipynb
 data
 .env
+
+gameplay_data/
+runs/
